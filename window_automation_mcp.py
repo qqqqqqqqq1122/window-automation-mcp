@@ -2,13 +2,13 @@
 """
 Windows Background HWND-Based UI Automation MCP Server
 ======================================================
-Provides 12 tools for background window manipulation via HWND handles.
+Provides 13 tools for background window manipulation via HWND handles.
 
 Capture fallback chain:  WGC (COM) → PrintWindow(PW_RENDERFULLCONTENT) → BitBlt(GDI)
 Input fallback chain:    UIA Patterns → SendMessage/PostMessage → Foreground simulation
 
 Author: Window Automation MCP
-Version: 2.0.0
+Version: 2.1.0
 """
 
 # ── stdlib ──────────────────────────────────────────────────────────────────
@@ -21,7 +21,9 @@ import io
 import json
 import logging
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import time
 import traceback
@@ -1147,11 +1149,203 @@ def wait_for_ui_change_impl(hwnd: int, timeout_seconds: float = 3.0) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SILENT APP LAUNCH (NO-ACTIVATE / HIDDEN LAUNCH)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Constants for silent process creation
+SW_SHOWNOACTIVATE = 4        # Show window but don't activate
+SW_SHOWMINNOACTIVE = 7       # Show minimized, don't activate
+STARTF_USESHOWWINDOW = 0x00000001
+CREATE_NO_WINDOW = 0x08000000
+CREATE_NEW_CONSOLE = 0x00000010
+NORMAL_PRIORITY_CLASS = 0x00000020
+SW_HIDE = 0
+
+# Win32 API structures for CreateProcess
+class _STARTUPINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.wintypes.DWORD),
+        ("lpReserved", ctypes.c_wchar_p),
+        ("lpDesktop", ctypes.c_wchar_p),
+        ("lpTitle", ctypes.c_wchar_p),
+        ("dwX", ctypes.wintypes.DWORD),
+        ("dwY", ctypes.wintypes.DWORD),
+        ("dwXSize", ctypes.wintypes.DWORD),
+        ("dwYSize", ctypes.wintypes.DWORD),
+        ("dwXCountChars", ctypes.wintypes.DWORD),
+        ("dwYCountChars", ctypes.wintypes.DWORD),
+        ("dwFillAttribute", ctypes.wintypes.DWORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("wShowWindow", ctypes.wintypes.WORD),
+        ("cbReserved2", ctypes.wintypes.WORD),
+        ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+        ("hStdInput", ctypes.wintypes.HANDLE),
+        ("hStdOutput", ctypes.wintypes.HANDLE),
+        ("hStdError", ctypes.wintypes.HANDLE),
+    ]
+
+
+class _PROCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", ctypes.wintypes.HANDLE),
+        ("hThread", ctypes.wintypes.HANDLE),
+        ("dwProcessId", ctypes.wintypes.DWORD),
+        ("dwThreadId", ctypes.wintypes.DWORD),
+    ]
+
+
+def _find_window_by_pid(pid: int, timeout: float = 5.0) -> int | None:
+    """Poll for a top-level visible window belonging to a PID."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found: list[int] = []
+
+        def _enum(hwnd: int, _lparam: Any) -> bool:
+            try:
+                _, wp = win32process.GetWindowThreadProcessId(hwnd)
+                if wp == pid and win32gui.IsWindowVisible(hwnd):
+                    title = win32gui.GetWindowText(hwnd)
+                    if title.strip():
+                        found.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(_enum, None)
+        if found:
+            # Return the largest window (main window)
+            best = found[0]
+            best_area = 0
+            for h in found:
+                try:
+                    r = win32gui.GetWindowRect(h)
+                    area = (r[2] - r[0]) * (r[3] - r[1])
+                    if area > best_area:
+                        best_area = area
+                        best = h
+                except Exception:
+                    pass
+            return best
+        time.sleep(0.15)
+    return None
+
+
+def start_app_silent_impl(app_path: str, args: str = "", work_dir: str = "") -> dict:
+    """
+    Launch an application silently — the window appears but does NOT
+    steal focus or pop to the foreground.
+
+    Uses CreateProcess with SW_SHOWNOACTIVATE to show the window
+    without activating it. For GUI apps, the window stays in the
+    background. For console apps, no new console window is created.
+
+    Returns: { "success": bool, "pid": int, "hwnd": int, "message": str }
+    """
+    if not os.path.exists(app_path) and not app_path.startswith(("cmd", "start")):
+        # Try to find the executable via PATH
+        resolved = shutil.which(app_path)
+        if resolved:
+            app_path = resolved
+        else:
+            return {
+                "success": False,
+                "pid": 0,
+                "hwnd": 0,
+                "message": f"Executable not found: {app_path}",
+            }
+
+    # Build command line
+    cmd_line = f'"{app_path}"'
+    if args:
+        cmd_line += f" {args}"
+
+    wd = work_dir if work_dir and os.path.isdir(work_dir) else os.path.dirname(app_path) or None
+
+    try:
+        # Use CreateProcessW directly for maximum control over window state
+        si = _STARTUPINFOW()
+        si.cb = ctypes.sizeof(_STARTUPINFOW)
+        si.dwFlags = STARTF_USESHOWWINDOW
+        si.wShowWindow = SW_SHOWNOACTIVATE  # Show but don't activate!
+
+        pi = _PROCESS_INFORMATION()
+
+        creation_flags = NORMAL_PRIORITY_CLASS
+
+        result = ctypes.windll.kernel32.CreateProcessW(
+            None,                          # lpApplicationName
+            cmd_line,                      # lpCommandLine
+            None,                          # lpProcessAttributes
+            None,                          # lpThreadAttributes
+            False,                         # bInheritHandles
+            creation_flags,                # dwCreationFlags
+            None,                          # lpEnvironment
+            wd,                            # lpCurrentDirectory
+            ctypes.byref(si),              # lpStartupInfo
+            ctypes.byref(pi),              # lpProcessInformation
+        )
+
+        if not result:
+            err = ctypes.windll.kernel32.GetLastError()
+            return {
+                "success": False,
+                "pid": 0,
+                "hwnd": 0,
+                "message": f"CreateProcess failed with error code: {err}",
+            }
+
+        pid = pi.dwProcessId
+
+        # Close thread handle (we don't need it)
+        ctypes.windll.kernel32.CloseHandle(pi.hThread)
+        ctypes.windll.kernel32.CloseHandle(pi.hProcess)
+
+        # Poll for the main window to appear (up to 5 seconds)
+        hwnd = _find_window_by_pid(pid, timeout=5.0)
+
+        if hwnd:
+            # Ensure it stays background (SW_SHOWNOACTIVATE)
+            try:
+                win32gui.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+            except Exception:
+                pass
+
+            title = _window_text(hwnd)
+            return {
+                "success": True,
+                "pid": pid,
+                "hwnd": hwnd,
+                "title": title,
+                "message": f"App launched silently. PID={pid}, HWND={hwnd}, Title='{title}'",
+            }
+        else:
+            return {
+                "success": True,
+                "pid": pid,
+                "hwnd": 0,
+                "message": (
+                    f"Process started (PID={pid}) but no visible window detected "
+                    f"within 5 seconds. The app may be a background process, "
+                    f"system tray app, or still initializing."
+                ),
+            }
+
+    except Exception as e:
+        log.exception("start_app_silent failed")
+        return {
+            "success": False,
+            "pid": 0,
+            "hwnd": 0,
+            "message": f"Launch failed: {e}",
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MCP SERVER SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SERVER_NAME = "window-automation"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = "2.1.0"
 
 server = Server(SERVER_NAME, version=SERVER_VERSION)
 
@@ -1400,6 +1594,30 @@ async def list_tools() -> list[Tool]:
                 "required": ["hwnd"],
             },
         ),
+        Tool(
+            name="start_app_silent",
+            description="Launch an application silently in the background without stealing focus or popping to the foreground. The app window appears but stays behind the current foreground window. Returns pid and hwnd on success. Use this when you need to open an app for automation without interrupting the user.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "app_path": {
+                        "type": "string",
+                        "description": "Full path to the executable (e.g. 'C:\\Windows\\notepad.exe' or 'calc.exe'). If only a name is given, it is resolved via system PATH.",
+                    },
+                    "args": {
+                        "type": "string",
+                        "description": "Optional command-line arguments to pass to the application.",
+                        "default": "",
+                    },
+                    "work_dir": {
+                        "type": "string",
+                        "description": "Optional working directory for the process. Defaults to the executable's directory.",
+                        "default": "",
+                    },
+                },
+                "required": ["app_path"],
+            },
+        ),
     ]
 
 
@@ -1482,6 +1700,14 @@ async def call_tool(tool_name: str, arguments: dict[str, Any]) -> list[TextConte
         elif tool_name == "activate":
             result = activate_impl(arguments["hwnd"])
             return [TextContent(type="text", text=result)]
+
+        elif tool_name == "start_app_silent":
+            result = start_app_silent_impl(
+                arguments["app_path"],
+                arguments.get("args", ""),
+                arguments.get("work_dir", ""),
+            )
+            return [TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
 
         else:
             return [TextContent(type="text", text=json.dumps(
