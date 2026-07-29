@@ -200,33 +200,150 @@ def _is_window(hwnd: int) -> bool:
         return False
 
 
+def _is_top_level(hwnd: int) -> bool:
+    """Check if a window has no parent (true top-level window)."""
+    try:
+        return win32gui.GetParent(hwnd) == 0
+    except Exception:
+        return False
+
+
+def _window_class(hwnd: int) -> str:
+    """Get window class name."""
+    try:
+        return win32gui.GetClassName(hwnd)
+    except Exception:
+        return ""
+
+
+def _get_process_name_by_pid(pid: int) -> str:
+    """Get process executable name by PID using Win32 API (no psutil dependency)."""
+    if pid == 0:
+        return ""
+    try:
+        h_process = ctypes.windll.kernel32.OpenProcess(
+            0x0400 | 0x0010,  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+            False, pid,
+        )
+        if h_process:
+            exe_name = ctypes.create_unicode_buffer(260)
+            size = ctypes.c_ulong(260)
+            success = ctypes.windll.psapi.GetModuleBaseNameW(
+                h_process, None, exe_name, size,
+            )
+            ctypes.windll.kernel32.CloseHandle(h_process)
+            if success:
+                return exe_name.value
+    except Exception:
+        pass
+    return ""
+
+
+# Cached PID → process name mapping for performance during EnumWindows
+_process_name_cache: dict[int, str] = {}
+
+
+def _cached_process_name(pid: int) -> str:
+    """Get process name with caching — EnumWindows hits the same PID many times."""
+    if pid not in _process_name_cache:
+        _process_name_cache[pid] = _get_process_name_by_pid(pid)
+    return _process_name_cache[pid]
+
+
+# System classes that are NEVER real application windows
+_SYSTEM_CLASSES: set[str] = {
+    "MSCTFIME UI",
+    "IME",
+    "SystemResourceNotifyWindow",
+    "tooltips_class32",
+    "SysShadow",
+    "Ghost",
+    "Progman",
+    "DummyDWMListenerWindow",
+    "Shell_TrayWnd",
+    "Button",
+    "TrayNotifyWnd",
+    "CiceroUIWndFrame",
+    "OfficeTooltip",
+    "TaskSwitcherWnd",
+    "OperationStatusWindow",
+}
+
+
+def _is_webview_window(hwnd: int) -> tuple[bool, str]:
+    """Detect CEF/WebView2/Electron windows via class name.
+    Returns (is_webview, engine_name)."""
+    cls = _window_class(hwnd).lower()
+    if "chrome_widgetwin" in cls:
+        return (True, "cef")
+    if "chrome_renderwidgethost" in cls:
+        return (True, "chromium")
+    if "webviewhost" in cls.lower():
+        return (True, "webview2")
+    return (False, "")
+
+
 def list_windows_impl(title_keyword: str = "") -> list[dict]:
-    """Enumerate all top-level windows matching optional keyword."""
+    """
+    Enumerate all top-level windows, optionally filtered by keyword.
+
+    The keyword is matched against window TITLE AND process EXE name.
+    Even hidden windows (IsWindowVisible=False) with empty titles ARE
+    returned if the keyword matches the process name.
+
+    This is critical for apps like WeChat that use a hidden main window
+    managed internally by CEF/Chromium frameworks.
+    """
+    # Flush PID→name cache each enumeration
+    _process_name_cache.clear()
+
     results: list[dict] = []
-    keyword_lower = title_keyword.lower() if title_keyword else ""
+    keyword_lower = title_keyword.lower().strip() if title_keyword else ""
 
     def _enum_callback(hwnd: int, _lparam: Any) -> bool:
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
-        title = win32gui.GetWindowText(hwnd)
-        if not title.strip():
-            return True
-        if keyword_lower and keyword_lower not in title.lower():
-            return True
-
         try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        except Exception:
-            pid = 0
+            # ── 1. Hard filter: skip child windows (non-top-level) ──
+            if not _is_top_level(hwnd):
+                return True
 
-        results.append({
-            "hwnd": hwnd,
-            "pid": pid,
-            "title": title,
-            "bounds": _get_window_rect(hwnd),
-            "is_minimized": _is_minimized(hwnd),
-            "is_visible": _is_visible(hwnd),
-        })
+            # ── 2. System junk class blacklist ──
+            cls_name = _window_class(hwnd)
+            if cls_name in _SYSTEM_CLASSES:
+                return True
+
+            # ── 3. Extract window info ──
+            title = win32gui.GetWindowText(hwnd)
+            is_vis = bool(win32gui.IsWindowVisible(hwnd))
+            is_min = bool(win32gui.IsIconic(hwnd))
+            rect = _get_window_rect(hwnd)
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            proc_name = _cached_process_name(pid) if pid else ""
+
+            # ── 4. Keyword matching ──
+            if keyword_lower:
+                title_match = keyword_lower in title.lower()
+                proc_match = keyword_lower in proc_name.lower()
+                cls_match = keyword_lower in cls_name.lower()
+                if not (title_match or proc_match or cls_match):
+                    return True
+
+            # ── 5. Detect WebView/CEF ──
+            is_webview, webview_engine = _is_webview_window(hwnd)
+
+            results.append({
+                "hwnd": hwnd,
+                "pid": pid,
+                "process_name": proc_name,
+                "title": title,
+                "class_name": cls_name,
+                "bounds": rect,
+                "is_minimized": is_min,
+                "is_visible": is_vis,
+                "is_webview": is_webview,
+                "webview_engine": webview_engine if is_webview else "",
+            })
+        except Exception:
+            pass
         return True
 
     win32gui.EnumWindows(_enum_callback, None)
@@ -828,43 +945,96 @@ def click_element_impl(hwnd: int, element_id_or_name: str) -> str:
 
 
 def click_coordinate_impl(hwnd: int, x: int, y: int) -> str:
-    """Send a click at window-relative client coordinates (x, y)."""
+    """Send a click at window-relative client coordinates (x, y).
+
+    For CEF/WebView2/Electron windows, SendMessage clicks are ignored
+    (the GPU-rendered content does not process WM_LBUTTONDOWN).
+    We detect this and fall through to foreground simulation immediately."""
     if not _is_window(hwnd):
         return _err_result(f"Invalid HWND: {hwnd}")
 
     if _is_minimized(hwnd):
         return _err_result("Window is minimized. Call activate() first, then retry.")
 
-    # Chain 1: SendMessage
-    if _send_click_message(hwnd, x, y):
-        return _ok_result(f"[SendMessage] Clicked at client ({x}, {y})")
+    is_webview, webview_engine = _is_webview_window(hwnd)
+
+    # Chain 1: SendMessage (SKIP for WebView/CEF — GPU content ignores it)
+    if not is_webview:
+        if _send_click_message(hwnd, x, y):
+            return _ok_result(f"[SendMessage] Clicked at client ({x}, {y})")
 
     # Chain 2: Foreground simulation
     try:
         activate_impl(hwnd)
         time.sleep(0.15)
-        # Convert client coords to screen coords
         pt = win32gui.ClientToScreen(hwnd, (x, y))
         win32api.SetCursorPos(pt)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         time.sleep(0.05)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        return _ok_result(f"[Foreground] Clicked at client ({x}, {y})")
+        method = "[Foreground" + (f"-WebView({webview_engine})]" if is_webview else "]")
+        return _ok_result(f"{method} Clicked at client ({x}, {y})")
     except Exception as e:
         return _err_result(f"All click methods failed at ({x}, {y}): {e}")
 
 
+def _clipboard_paste(hwnd: int, text: str) -> bool:
+    """Set clipboard text and send Ctrl+V to the window.
+    Used for CEF/WebView2/Electron windows that don't process WM_CHAR."""
+    try:
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+        win32clipboard.CloseClipboard()
+        time.sleep(0.05)
+        # Send Ctrl+V
+        activate_impl(hwnd)
+        time.sleep(0.1)
+        win32api.keybd_event(VK_CONTROL, 0, 0, 0)
+        win32api.keybd_event(ord('V'), 0, 0, 0)
+        time.sleep(0.03)
+        win32api.keybd_event(ord('V'), 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32api.keybd_event(VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+        return True
+    except Exception:
+        return False
+
+
 def type_text_impl(hwnd: int, element_id_or_name: str, text: str) -> str:
-    """Type text into an element using UIA ValuePattern → WM_CHAR → foreground chain."""
+    """Type text into an element. For CEF/WebView2 windows, uses clipboard paste
+    (WM_CHAR messages are ignored by GPU-rendered content)."""
     if not _is_window(hwnd):
         return _err_result(f"Invalid HWND: {hwnd}")
 
     if _is_minimized(hwnd):
         return _err_result("Window is minimized. Call activate() first, then retry.")
 
+    is_webview, webview_engine = _is_webview_window(hwnd)
+
+    # ── WebView/CEF path: skip WM_CHAR, use clipboard paste ──
+    if is_webview and text:
+        if _clipboard_paste(hwnd, text):
+            return _ok_result(f"[Clipboard-WebView({webview_engine})] Pasted '{text}' via Ctrl+V")
+
+        # Fallback: try foreground keyboard for single chars
+        try:
+            activate_impl(hwnd)
+            time.sleep(0.1)
+            for ch in text:
+                vk = VK_MAP.get(ch.lower(), 0)
+                if vk == 0 and ch.isprintable():
+                    vk = ord(ch.upper())
+                if vk:
+                    win32api.keybd_event(vk, 0, 0, 0)
+                    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+                    time.sleep(0.01)
+            return _ok_result(f"[Foreground-WebView] Typed '{text}' via keybd_event")
+        except Exception as e:
+            return _err_result(f"WebView text input failed: {e}")
+
+    # ── Standard path: UIA → SendMessage → Foreground ──
     control = _resolve_element(hwnd, element_id_or_name)
     if control is None:
-        # If no element resolved, try sending text directly to the window
         if _send_text_message(hwnd, text):
             return _ok_result(f"[SendMessage] Sent text to HWND {hwnd}")
         return _err_result(f"Cannot find element matching: '{element_id_or_name}'")
@@ -878,7 +1048,7 @@ def type_text_impl(hwnd: int, element_id_or_name: str, text: str) -> str:
     if _uia_set_value(control, text):
         return _ok_result(f"[UIA] Typed '{text}' into '{ctl_name}'")
 
-    # Chain 2: Focus element then SendMessage
+    # Chain 2: SendMessage
     try:
         control.SetFocus()
         time.sleep(0.05)
@@ -887,24 +1057,21 @@ def type_text_impl(hwnd: int, element_id_or_name: str, text: str) -> str:
 
     try:
         hwnd_focus = win32gui.GetFocus()
-        if hwnd_focus:
-            if _send_text_message(hwnd_focus, text):
-                return _ok_result(f"[SendMessage] Typed '{text}' into '{ctl_name}' (via focus)")
+        if hwnd_focus and _send_text_message(hwnd_focus, text):
+            return _ok_result(f"[SendMessage] Typed '{text}' into '{ctl_name}' (via focus)")
     except Exception:
         pass
 
-    # Chain 3: Send directly to window
     if _send_text_message(hwnd, text):
         return _ok_result(f"[SendMessage] Typed '{text}' into HWND {hwnd}")
 
-    # Chain 4: Foreground keyboard simulation
+    # Chain 3: Foreground keyboard simulation
     try:
         activate_impl(hwnd)
         time.sleep(0.15)
         control.Click()
         time.sleep(0.1)
         for ch in text:
-            # Use VK codes where possible; fall back to SendInput
             if ch.isprintable():
                 import ctypes
                 INPUT_KEYBOARD = 1
@@ -1356,13 +1523,13 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="list_windows",
-            description="List all visible top-level windows, optionally filtered by title keyword. Returns JSON with hwnd, pid, title, bounds, is_minimized, is_visible for each match.",
+            description="List all visible top-level windows, optionally filtered by title keyword. Also matches process name (e.g. 'WeChatAppEx' finds WeChat even when its window title is empty). Returns JSON with hwnd, pid, process_name, title, bounds, class_name, is_visible, is_webview, webview_engine for each match.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "title_keyword": {
                         "type": "string",
-                        "description": "Optional substring to filter window titles (case-insensitive). Empty string returns all visible windows.",
+                        "description": "Optional substring to filter by window title, process name, or class name (case-insensitive). Use empty string for all windows. For hidden/hollow windows (e.g. CEF apps), search by process name like 'WeChatAppEx'.",
                         "default": "",
                     }
                 },

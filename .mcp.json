@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "window-automation": {
+      "command": "G:\\install_mcp_UI_interaction\\.venv\\Scripts\\python.exe",
+      "args": [
+        "G:\\install_mcp_UI_interaction\\window_automation_mcp.py"
+      ]
+    }
+  }
+}
