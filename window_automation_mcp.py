@@ -292,28 +292,66 @@ _SYSTEM_CLASSES: set[str] = {
 }
 
 
-def _needs_foreground_input(hwnd: int) -> tuple[bool, str]:
-    """Detect windows that cannot process SendMessage/WM_CHAR.
-    This includes CEF/WebView2/Electron (GPU-rendered content) AND
-    UWP/Store apps (ApplicationFrameWindow sandbox).
+# Window classes KNOWN to process SendMessage/WM_CHAR correctly.
+# For ALL other classes, we skip SendMessage and use foreground simulation
+# to guarantee delivery. This is a WHITELIST approach: new app types
+# automatically get foreground without needing code changes.
+_SENDMESSAGE_SAFE_CLASSES: set[str] = {
+    "edit", "button", "static", "listbox", "combobox", "scrollbar",
+    "richedit20a", "richedit20w", "richedit", "msctls_statusbar32",
+    "msctls_progress32", "msctls_trackbar32", "syslistview32",
+    "systreeview32", "sysheader32", "toolbarwindow32",
+    "msctls_updown32", "sysdatetimepick32", "sysmonthcal32",
+    "syslink", "sysanimate32", "msctls_hotkey32",
+    "rctrl_renwnd32", "internet_explorer_server",
+    "#32770",  # dialog
+    "afx:",     # MFC
+}
 
-    Returns (needs_foreground, reason)."""
+
+def _can_process_sendmessage(hwnd: int) -> tuple[bool, str]:
+    """Check if SendMessage/WM_CHAR is likely to work for this window.
+
+    Uses a WHITELIST of known-safe Win32 control classes.
+    Everything else (CEF, WebView2, UWP, Qt, Java, WPF custom, Electron,
+    Tauri, etc.) gets foreground simulation to guarantee delivery.
+
+    This is deliberately conservative: better to use foreground unnecessarily
+    than to silently fail with SendMessage."""
     cls = _window_class(hwnd).lower()
-    # CEF / Electron
+
+    if not cls:
+        return (False, "unknown-class")
+
+    # Exact match on known-safe classes
+    for safe in _SENDMESSAGE_SAFE_CLASSES:
+        if cls == safe or cls.startswith(safe):
+            return (True, "")
+
+    return (False, cls)
+
+
+# Backward-compatible alias (returns inverted: True = CANNOT use SendMessage)
+def _needs_foreground_input(hwnd: int) -> tuple[bool, str]:
+    can, _ = _can_process_sendmessage(hwnd)
+    if can:
+        return (False, "")
+    _, reason = _can_process_sendmessage(hwnd)
+    # Map class name to human-readable engine name
+    cls = _window_class(hwnd).lower()
     if "chrome_widgetwin" in cls:
         return (True, "cef")
-    if "chrome_renderwidgethost" in cls:
-        return (True, "chromium")
-    # WebView2
-    if "webviewhost" in cls:
+    if "webview" in cls:
         return (True, "webview2")
-    # UWP / Windows Store apps — sandboxed, don't process external messages
-    if cls in ("applicationframewindow", "windows.ui.core.corewindow"):
+    if "applicationframe" in cls:
         return (True, "uwp")
-    return (False, "")
+    if "qt" in cls or "qwidget" in cls:
+        return (True, "qt")
+    if "swt_" in cls or "sunawt" in cls:
+        return (True, "java")
+    return (True, reason or "custom-gpu")
 
 
-# Backward-compatible alias
 _is_webview_window = _needs_foreground_input
 
 
@@ -1073,14 +1111,15 @@ def type_text_impl(hwnd: int, element_id_or_name: str, text: str) -> str:
     if _is_minimized(hwnd):
         return _err_result("Window is minimized. Call activate() first, then retry.")
 
-    is_webview, webview_engine = _is_webview_window(hwnd)
+    needs_fg, fg_reason = _needs_foreground_input(hwnd)
 
-    # ── WebView/CEF path: skip WM_CHAR, use clipboard paste ──
-    if is_webview and text:
+    # ── Non-standard window path: skip WM_CHAR, use clipboard paste ──
+    #     (covers CEF, WebView2, UWP, Qt, Java, Electron, Tauri — any custom UI)
+    if needs_fg and text:
         if _clipboard_paste(hwnd, text):
-            return _ok_result(f"[Clipboard-WebView({webview_engine})] Pasted '{text}' via Ctrl+V")
+            return _ok_result(f"[Clipboard-{fg_reason}] Pasted '{text}' via Ctrl+V")
 
-        # Fallback: try foreground keyboard for single chars
+        # Fallback: try foreground keyboard
         try:
             activate_impl(hwnd)
             time.sleep(0.1)
@@ -1092,11 +1131,11 @@ def type_text_impl(hwnd: int, element_id_or_name: str, text: str) -> str:
                     win32api.keybd_event(vk, 0, 0, 0)
                     win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
                     time.sleep(0.01)
-            return _ok_result(f"[Foreground-WebView] Typed '{text}' via keybd_event")
+            return _ok_result(f"[Foreground-{fg_reason}] Typed '{text}' via keybd_event")
         except Exception as e:
-            return _err_result(f"WebView text input failed: {e}")
+            return _err_result(f"Non-standard window text input failed: {e}")
 
-    # ── Standard path: UIA → SendMessage → Foreground ──
+    # ── Standard Win32 path: UIA → SendMessage → Foreground ──
     control = _resolve_element(hwnd, element_id_or_name)
     if control is None:
         if _send_text_message(hwnd, text):
