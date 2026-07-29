@@ -107,6 +107,28 @@ VK_MAP: dict[str, int] = {
     "pageup": VK_PRIOR, "pgup": VK_PRIOR,
     "pagedown": VK_NEXT, "pgdn": VK_NEXT,
     "insert": VK_INSERT, "ins": VK_INSERT,
+    # Math / symbol keys (common on all keyboard layouts via keybd_event)
+    "plus": 0xBB, "add": 0x6B,        # VK_OEM_PLUS / VK_ADD
+    "minus": 0xBD, "subtract": 0x6D,  # VK_OEM_MINUS / VK_SUBTRACT
+    "multiply": 0x6A,                  # VK_MULTIPLY (*)
+    "divide": 0x6F,                    # VK_DIVIDE (/)
+    "decimal": 0xBE,                   # VK_OEM_PERIOD (.)
+    "equals": 0xBB,                    # = (same as plus on US keyboard)
+    "semicolon": 0xBA,                 # VK_OEM_1 (;)
+    "comma": 0xBC,                     # VK_OEM_COMMA
+    "period": 0xBE,                    # VK_OEM_PERIOD
+    "slash": 0xBF,                     # VK_OEM_2
+    "backslash": 0xDC,                 # VK_OEM_5
+    "bracketleft": 0xDB,              # [
+    "bracketright": 0xDD,             # ]
+    "quote": 0xDE,                     # '
+    "apostrophe": 0xDE,                # '
+    "grave": 0xC0,                     # `
+    "apps": 0x5D,                      # context menu key
+    "printscreen": 0x2C, "prtsc": 0x2C,
+    "numlock": 0x90,
+    "scrolllock": 0x91,
+    "capslock": 0x14,
 }
 for _i in range(1, 13):
     VK_MAP[f"f{_i}"] = VK_F1 + _i - 1
@@ -270,17 +292,29 @@ _SYSTEM_CLASSES: set[str] = {
 }
 
 
-def _is_webview_window(hwnd: int) -> tuple[bool, str]:
-    """Detect CEF/WebView2/Electron windows via class name.
-    Returns (is_webview, engine_name)."""
+def _needs_foreground_input(hwnd: int) -> tuple[bool, str]:
+    """Detect windows that cannot process SendMessage/WM_CHAR.
+    This includes CEF/WebView2/Electron (GPU-rendered content) AND
+    UWP/Store apps (ApplicationFrameWindow sandbox).
+
+    Returns (needs_foreground, reason)."""
     cls = _window_class(hwnd).lower()
+    # CEF / Electron
     if "chrome_widgetwin" in cls:
         return (True, "cef")
     if "chrome_renderwidgethost" in cls:
         return (True, "chromium")
-    if "webviewhost" in cls.lower():
+    # WebView2
+    if "webviewhost" in cls:
         return (True, "webview2")
+    # UWP / Windows Store apps — sandboxed, don't process external messages
+    if cls in ("applicationframewindow", "windows.ui.core.corewindow"):
+        return (True, "uwp")
     return (False, "")
+
+
+# Backward-compatible alias
+_is_webview_window = _needs_foreground_input
 
 
 def list_windows_impl(title_keyword: str = "") -> list[dict]:
@@ -347,6 +381,11 @@ def list_windows_impl(title_keyword: str = "") -> list[dict]:
         return True
 
     win32gui.EnumWindows(_enum_callback, None)
+    # Sort by window area descending — main window first, helper windows last
+    results.sort(
+        key=lambda w: w["bounds"].get("width", 0) * w["bounds"].get("height", 0),
+        reverse=True,
+    )
     return results
 
 
@@ -735,8 +774,9 @@ def _resolve_element(hwnd: int, element_id_or_name: str) -> uia.Control | None:
     """
     Resolve an element reference. Tries in order:
       1. Exact match on AutomationId
-      2. Substring match on Name
-      3. Treat as an integer index into children of root
+      2. EXACT match on Name (full string equality)
+      3. Substring match on Name (shortest name wins — avoids "清除"→"清除所有记忆")
+      4. ControlTypeName match
     """
     try:
         root = uia.ControlFromHandle(hwnd)
@@ -769,29 +809,53 @@ def _resolve_element(hwnd: int, element_id_or_name: str) -> uia.Control | None:
     if result:
         return result
 
-    # 2. Name substring match
-    def _by_name(ctl: uia.Control, depth: int = 0) -> uia.Control | None:
+    # 2. Name EXACT match (recursive, collects all candidates)
+    def _collect_by_name_exact(ctl: uia.Control, depth: int = 0) -> list[uia.Control]:
+        results: list[uia.Control] = []
         if depth > 8:
-            return None
+            return results
         try:
-            if target in (ctl.Name or "").lower():
-                return ctl
+            if (ctl.Name or "").lower() == target:
+                results.append(ctl)
         except Exception:
             pass
         try:
             for child in ctl.GetChildren():
-                result = _by_name(child, depth + 1)
-                if result:
-                    return result
+                results.extend(_collect_by_name_exact(child, depth + 1))
         except Exception:
             pass
-        return None
+        return results
 
-    result = _by_name(root)
-    if result:
-        return result
+    exact_matches = _collect_by_name_exact(root)
+    if exact_matches:
+        return exact_matches[0]
 
-    # 3. ControlTypeName match
+    # 3. Name SUBSTRING match — collect ALL, prefer SHORTEST name
+    #    (prevents "清除" from matching "清除所有记忆" when "清除条目" is available)
+    def _collect_by_name_substr(ctl: uia.Control, depth: int = 0) -> list[uia.Control]:
+        results: list[uia.Control] = []
+        if depth > 8:
+            return results
+        try:
+            name = (ctl.Name or "").lower()
+            if target in name:
+                results.append(ctl)
+        except Exception:
+            pass
+        try:
+            for child in ctl.GetChildren():
+                results.extend(_collect_by_name_substr(child, depth + 1))
+        except Exception:
+            pass
+        return results
+
+    substr_matches = _collect_by_name_substr(root)
+    if substr_matches:
+        # Sort by name length (shorter = more specific match)
+        substr_matches.sort(key=lambda c: len(c.Name or ""))
+        return substr_matches[0]
+
+    # 4. ControlTypeName match
     def _by_type(ctl: uia.Control, depth: int = 0) -> uia.Control | None:
         if depth > 8:
             return None
@@ -956,10 +1020,10 @@ def click_coordinate_impl(hwnd: int, x: int, y: int) -> str:
     if _is_minimized(hwnd):
         return _err_result("Window is minimized. Call activate() first, then retry.")
 
-    is_webview, webview_engine = _is_webview_window(hwnd)
+    needs_fg, fg_reason = _needs_foreground_input(hwnd)
 
-    # Chain 1: SendMessage (SKIP for WebView/CEF — GPU content ignores it)
-    if not is_webview:
+    # Chain 1: SendMessage (SKIP for CEF/WebView/UWP — cannot process external messages)
+    if not needs_fg:
         if _send_click_message(hwnd, x, y):
             return _ok_result(f"[SendMessage] Clicked at client ({x}, {y})")
 
@@ -972,7 +1036,7 @@ def click_coordinate_impl(hwnd: int, x: int, y: int) -> str:
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         time.sleep(0.05)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        method = "[Foreground" + (f"-WebView({webview_engine})]" if is_webview else "]")
+        method = "[Foreground" + (f"-{fg_reason}]" if needs_fg else "]")
         return _ok_result(f"{method} Clicked at client ({x}, {y})")
     except Exception as e:
         return _err_result(f"All click methods failed at ({x}, {y}): {e}")
@@ -1175,9 +1239,17 @@ def send_hotkey_impl(hwnd: int, hotkey: str) -> str:
         return _err_result("Window is minimized. Call activate() first, then retry.")
 
     # Parse hotkey
-    parts = [p.strip().lower() for p in hotkey.split("+")]
+    # Special case: standalone symbol key like "plus", "slash", "grave"
+    hotkey_lower = hotkey.strip().lower()
+    if hotkey_lower in VK_MAP and "+" not in hotkey_lower:
+        parts = [hotkey_lower]
+    else:
+        parts = [p.strip().lower() for p in hotkey.split("+")]
+        # Filter empty strings from split (e.g. "Shift++" → ["shift", "", ""] → ["shift"])
+        parts = [p for p in parts if p]
+
     if len(parts) < 1:
-        return _err_result(f"Invalid hotkey: '{hotkey}'. Use format like 'Ctrl+C', 'Alt+F4', or 'Esc'.")
+        return _err_result(f"Invalid hotkey: '{hotkey}'. Use format like 'Ctrl+C', 'Alt+F4', 'Esc', or 'plus'.")
 
     modifiers: list[int] = []
     key = None
